@@ -1,0 +1,5 @@
+GPL-2.0-only
+
+Kernel driver, device tree fragments, and camss register tables in this
+repository are provided under the GNU General Public License version 2 only.
+See the SPDX headers in individual files.
