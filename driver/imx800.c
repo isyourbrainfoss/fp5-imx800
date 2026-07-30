@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Sony IMX800 camera sensor driver (Fairphone 5 bring-up)
+ * Sony IMX800 multi-mode stream for Fairphone 5 (postmarketOS).
+ * module_param xclr=N : TLMM pin offset on f100000.pinctrl (active-low XCLR)
  *
- * Single mode (from vendor sensor module RE):
- *   4096x3072, 10-bit BGGR, 2x2 bin from QCFA 8192x6144
- *   FLL=7484, LLP=9776, CSI-2 C-PHY 3-trio @ 700 MHz link frequency
- *
- * Requires DT power rails + reset, and a CSIPHY path that supports C-PHY
- * (on SM7325/sc7280: camss C-PHY sequence for qcom,csiphy-v1.2.1).
+ * Modes from Android CamX BinaryParameter RE (see parse_camx_imx800.py):
+ *  - CamX 4: 1920x1080 4x4 bin  (default — preview / reduced CMA)
+ *  - CamX 1: 4096x3072 2x2 bin  (hi-res still)
+ *  - CamX 5: 1280x720  4x4 bin  (ultra-light preview)
+ * C-PHY 3-trio, CSIPHY0, SBGGR10. CSI link needs CSIPHY0 C-PHY endpoint in DT.
  */
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -32,11 +32,8 @@
 #define IMX800_MODE_STANDBY		0x00
 #define IMX800_MODE_STREAMING		0x01
 #define IMX800_INCLK_RATE		24000000
-#define IMX800_MODE1_VBLANK		(IMX800_MODE1_FLL - IMX800_MODE1_HEIGHT)
-/* Mode-1 link frequency (Hz); keep ≤ timer limits in camss. */
+/* Link freq from DT / CamX OPC path (Hz). Shared across modes. */
 #define IMX800_LINK_FREQ_700MHZ		700000000ULL
-/* Approximate pixel rate for V4L2_CID_PIXEL_RATE. */
-#define IMX800_PIXEL_RATE		450000000ULL
 
 static int xclr_gpio = -1;
 module_param_named(xclr, xclr_gpio, int, 0644);
@@ -45,18 +42,27 @@ MODULE_PARM_DESC(xclr, "TLMM pin offset for XCLR (active low), -1=DT/none");
 static int try_stream = 1;
 module_param(try_stream, int, 0644);
 MODULE_PARM_DESC(try_stream,
-		 "If 1 (default), s_stream programs init+mode1 tables and MODE_SELECT");
+		 "If 1 (default), s_stream programs CamX init+mode tables and MODE_SELECT");
 
 static int program_on_probe = 0;
 module_param(program_on_probe, int, 0644);
 MODULE_PARM_DESC(program_on_probe,
-		 "If 1, write init+mode1+stream-on during probe (CCI validation)");
+		 "If 1, write init+default-mode+stream-on during probe (CCI validation)");
 
-/* Degrees clockwise for V4L2_CID_CAMERA_SENSOR_ROTATION (default matches board DT). */
+/*
+ * Degrees clockwise for V4L2_CID_CAMERA_SENSOR_ROTATION / libcamera.
+ * Match imx858/s5kjn1 (270). 90 left the main camera upside-down in Snapshot.
+ */
 static int rotation = 270;
 module_param(rotation, int, 0644);
 MODULE_PARM_DESC(rotation,
 		 "Sensor rotation degrees clockwise (0/90/180/270); default 270");
+
+/* Force a CamX mode index at probe (4=1080p, 1=4K-bin, 5=720p); -1=default. */
+static int default_camx_mode = -1;
+module_param(default_camx_mode, int, 0644);
+MODULE_PARM_DESC(default_camx_mode,
+		 "CamX mode index for default format (-1=table default 1080p, 4/1/5)");
 
 static const char * const imx800_supply_names[] = {
 	"vana1", "vana2", "vdig", "vif",
@@ -78,11 +84,84 @@ struct imx800 {
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *exposure;
+	const struct imx800_mode_info *cur_mode;
+	bool streaming;
 };
 
 static inline struct imx800 *to_imx800(struct v4l2_subdev *sd)
 {
 	return container_of(sd, struct imx800, sd);
+}
+
+static const struct imx800_mode_info *imx800_find_mode_by_camx(unsigned int idx)
+{
+	unsigned int i;
+
+	for (i = 0; i < IMX800_NUM_MODES; i++) {
+		if (imx800_modes[i].camx_index == idx)
+			return &imx800_modes[i];
+	}
+	return NULL;
+}
+
+static const struct imx800_mode_info *
+imx800_find_nearest_mode(u32 width, u32 height)
+{
+	const struct imx800_mode_info *best = &imx800_modes[0];
+	u64 best_dist = U64_MAX;
+	unsigned int i;
+
+	for (i = 0; i < IMX800_NUM_MODES; i++) {
+		const struct imx800_mode_info *m = &imx800_modes[i];
+		u32 dw = (m->width > width) ? m->width - width : width - m->width;
+		u32 dh = (m->height > height) ? m->height - height : height - m->height;
+		u64 dist = (u64)dw + dh;
+
+		if (dist < best_dist) {
+			best_dist = dist;
+			best = m;
+		}
+	}
+	return best;
+}
+
+static void imx800_fill_format(struct v4l2_mbus_framefmt *fmt,
+			       const struct imx800_mode_info *mode)
+{
+	fmt->width = mode->width;
+	fmt->height = mode->height;
+	/* Android camera0 colorFilterArrangement = BGGR (not RGGB). */
+	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	fmt->field = V4L2_FIELD_NONE;
+	fmt->colorspace = V4L2_COLORSPACE_RAW;
+	fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
+}
+
+static void imx800_update_controls(struct imx800 *imx800,
+				   const struct imx800_mode_info *mode)
+{
+	u32 vblank = mode->fll - mode->height;
+	u32 hblank = mode->llp - mode->width;
+
+	if (imx800->pixel_rate)
+		__v4l2_ctrl_s_ctrl_int64(imx800->pixel_rate, mode->pixel_rate);
+	if (imx800->vblank) {
+		__v4l2_ctrl_modify_range(imx800->vblank, vblank, vblank, 1, vblank);
+		__v4l2_ctrl_s_ctrl(imx800->vblank, vblank);
+	}
+	if (imx800->hblank) {
+		__v4l2_ctrl_modify_range(imx800->hblank, hblank, hblank, 1, hblank);
+		__v4l2_ctrl_s_ctrl(imx800->hblank, hblank);
+	}
+	if (imx800->exposure) {
+		__v4l2_ctrl_modify_range(imx800->exposure, 1, mode->fll - 1, 1,
+					 mode->height);
+	}
 }
 
 static int imx800_power_on(struct device *dev)
@@ -154,24 +233,11 @@ static int imx800_detect(struct imx800 *imx800)
 	dev_info(imx800->dev, "IMX800 chip id 0x%04llx (expect 0x%04x)\n",
 		 val, IMX800_CHIP_ID_EXPECT);
 	dev_info(imx800->dev,
-		 "mode1 tables: %ux%u FLL=%u LLP=%u init=%zu mode=%zu (mode tables)\n",
-		 IMX800_MODE1_WIDTH, IMX800_MODE1_HEIGHT,
-		 IMX800_MODE1_FLL, IMX800_MODE1_LLP,
-		 ARRAY_SIZE(imx800_init_regs), ARRAY_SIZE(imx800_mode1_regs));
+		 "modes: default %ux%u camx=%u (n=%u); hi-res %ux%u\n",
+		 imx800->cur_mode->width, imx800->cur_mode->height,
+		 imx800->cur_mode->camx_index, (unsigned int)IMX800_NUM_MODES,
+		 IMX800_MODE1_WIDTH, IMX800_MODE1_HEIGHT);
 	return 0;
-}
-
-static void imx800_fill_format(struct v4l2_mbus_framefmt *fmt)
-{
-	fmt->width = IMX800_MODE1_WIDTH;
-	fmt->height = IMX800_MODE1_HEIGHT;
-	/* Android camera0 colorFilterArrangement = BGGR (not RGGB). */
-	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;
-	fmt->field = V4L2_FIELD_NONE;
-	fmt->colorspace = V4L2_COLORSPACE_RAW;
-	fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
 }
 
 static int imx800_enum_mbus_code(struct v4l2_subdev *sd,
@@ -184,19 +250,23 @@ static int imx800_enum_mbus_code(struct v4l2_subdev *sd,
 	return 0;
 }
 
+/* Required by libcamera CameraSensorLegacy ("No image format found" without it). */
 static int imx800_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fsize)
 {
-	if (fsize->index > 0)
+	const struct imx800_mode_info *mode;
+
+	if (fsize->index >= IMX800_NUM_MODES)
 		return -EINVAL;
 	if (fsize->code != MEDIA_BUS_FMT_SBGGR10_1X10)
 		return -EINVAL;
 
-	fsize->min_width = IMX800_MODE1_WIDTH;
-	fsize->max_width = IMX800_MODE1_WIDTH;
-	fsize->min_height = IMX800_MODE1_HEIGHT;
-	fsize->max_height = IMX800_MODE1_HEIGHT;
+	mode = &imx800_modes[fsize->index];
+	fsize->min_width = mode->width;
+	fsize->max_width = mode->width;
+	fsize->min_height = mode->height;
+	fsize->max_height = mode->height;
 	return 0;
 }
 
@@ -204,13 +274,15 @@ static int imx800_get_fmt(struct v4l2_subdev *sd,
 			  struct v4l2_subdev_state *state,
 			  struct v4l2_subdev_format *fmt)
 {
+	struct imx800 *imx800 = to_imx800(sd);
+
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		struct v4l2_mbus_framefmt *try_fmt;
 
 		try_fmt = v4l2_subdev_state_get_format(state, fmt->pad);
 		fmt->format = *try_fmt;
 	} else {
-		imx800_fill_format(&fmt->format);
+		imx800_fill_format(&fmt->format, imx800->cur_mode);
 	}
 	return 0;
 }
@@ -219,14 +291,28 @@ static int imx800_set_fmt(struct v4l2_subdev *sd,
 			  struct v4l2_subdev_state *state,
 			  struct v4l2_subdev_format *fmt)
 {
-	/* Single fixed mode: always report mode-1. */
-	imx800_fill_format(&fmt->format);
+	struct imx800 *imx800 = to_imx800(sd);
+	const struct imx800_mode_info *mode;
+
+	if (imx800->streaming && fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+		return -EBUSY;
+
+	mode = imx800_find_nearest_mode(fmt->format.width, fmt->format.height);
+	imx800_fill_format(&fmt->format, mode);
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		struct v4l2_mbus_framefmt *try_fmt;
 
 		try_fmt = v4l2_subdev_state_get_format(state, fmt->pad);
 		*try_fmt = fmt->format;
+	} else {
+		imx800->cur_mode = mode;
+		imx800_update_controls(imx800, mode);
+		dev_info(imx800->dev,
+			 "active mode camx=%u %ux%u FLL=%u LLP=%u (RAW10≈%u KiB/frame)\n",
+			 mode->camx_index, mode->width, mode->height,
+			 mode->fll, mode->llp,
+			 (mode->width * mode->height * 10 / 8) / 1024);
 	}
 	return 0;
 }
@@ -235,15 +321,17 @@ static int imx800_get_selection(struct v4l2_subdev *sd,
 				struct v4l2_subdev_state *state,
 				struct v4l2_subdev_selection *sel)
 {
-	/* Native array is QCFA 8192x6144; mode-1 is 2x2 binned 4096x3072. */
+	struct imx800 *imx800 = to_imx800(sd);
+
+	/* Native array is QCFA 8192x6144; active crop = current mode output. */
 	switch (sel->target) {
 	case V4L2_SEL_TGT_CROP:
 	case V4L2_SEL_TGT_CROP_DEFAULT:
 	case V4L2_SEL_TGT_CROP_BOUNDS:
 		sel->r.left = 0;
 		sel->r.top = 0;
-		sel->r.width = IMX800_MODE1_WIDTH;
-		sel->r.height = IMX800_MODE1_HEIGHT;
+		sel->r.width = imx800->cur_mode->width;
+		sel->r.height = imx800->cur_mode->height;
 		return 0;
 	case V4L2_SEL_TGT_NATIVE_SIZE:
 		sel->r.left = 0;
@@ -259,15 +347,17 @@ static int imx800_get_selection(struct v4l2_subdev *sd,
 static int imx800_init_state(struct v4l2_subdev *sd,
 			     struct v4l2_subdev_state *state)
 {
+	struct imx800 *imx800 = to_imx800(sd);
 	struct v4l2_mbus_framefmt *fmt;
 
 	fmt = v4l2_subdev_state_get_format(state, 0);
-	imx800_fill_format(fmt);
+	imx800_fill_format(fmt, imx800->cur_mode);
 	return 0;
 }
 
-static int imx800_write_mode1(struct imx800 *imx800)
+static int imx800_write_mode(struct imx800 *imx800)
 {
+	const struct imx800_mode_info *mode = imx800->cur_mode;
 	int ret = 0;
 
 	ret = cci_multi_reg_write(imx800->regmap, imx800_init_regs,
@@ -276,12 +366,13 @@ static int imx800_write_mode1(struct imx800 *imx800)
 		dev_err(imx800->dev, "init regs failed: %d\n", ret);
 		return ret;
 	}
+	/* CamX init last entry delayUs=35 */
 	usleep_range(50, 100);
 
-	ret = cci_multi_reg_write(imx800->regmap, imx800_mode1_regs,
-				  ARRAY_SIZE(imx800_mode1_regs), NULL);
+	ret = cci_multi_reg_write(imx800->regmap, mode->regs, mode->num_regs, NULL);
 	if (ret) {
-		dev_err(imx800->dev, "mode1 regs failed: %d\n", ret);
+		dev_err(imx800->dev, "mode camx=%u regs failed: %d\n",
+			mode->camx_index, ret);
 		return ret;
 	}
 	return 0;
@@ -294,7 +385,7 @@ static int imx800_s_stream(struct v4l2_subdev *sd, int enable)
 
 	if (!try_stream) {
 		dev_info(imx800->dev,
-			 "s_stream(%d): try_stream=0 (set try_stream=1 to program mode tables)\n",
+			 "s_stream(%d): try_stream=0 (set try_stream=1 for CamX tables)\n",
 			 enable);
 		return enable ? -EOPNOTSUPP : 0;
 	}
@@ -308,7 +399,7 @@ static int imx800_s_stream(struct v4l2_subdev *sd, int enable)
 		/* Re-power may leave sensor in reset; re-detect then program */
 		ret = imx800_detect(imx800);
 		if (!ret)
-			ret = imx800_write_mode1(imx800);
+			ret = imx800_write_mode(imx800);
 		if (!ret) {
 			/* allow PLL settle before MODE_SELECT streaming */
 			msleep(10);
@@ -318,19 +409,28 @@ static int imx800_s_stream(struct v4l2_subdev *sd, int enable)
 						  NULL);
 		}
 		if (!ret) {
-			u64 mode = 0;
-			cci_read(imx800->regmap, IMX800_REG_MODE_SELECT, &mode, NULL);
-			dev_info(imx800->dev, "MODE_SELECT after stream-on = 0x%llx\n", mode);
+			u64 mode_sel = 0;
+
+			cci_read(imx800->regmap, IMX800_REG_MODE_SELECT,
+				 &mode_sel, NULL);
+			dev_info(imx800->dev,
+				 "MODE_SELECT after stream-on = 0x%llx\n",
+				 mode_sel);
 		}
 		dev_info(imx800->dev,
-			 "s_stream on: init+mode1+0x0100 ret=%d\n", ret);
+			 "s_stream on: camx=%u %ux%u ret=%d\n",
+			 imx800->cur_mode->camx_index,
+			 imx800->cur_mode->width, imx800->cur_mode->height, ret);
 		if (ret)
 			pm_runtime_put(imx800->dev);
+		else
+			imx800->streaming = true;
 	} else {
 		ret = cci_multi_reg_write(imx800->regmap, imx800_stream_off_regs,
 					  ARRAY_SIZE(imx800_stream_off_regs),
 					  NULL);
 		dev_info(imx800->dev, "s_stream off: MODE ret=%d\n", ret);
+		imx800->streaming = false;
 		pm_runtime_put_autosuspend(imx800->dev);
 	}
 	return ret;
@@ -357,8 +457,10 @@ static const struct v4l2_subdev_internal_ops imx800_internal_ops = {
 static int imx800_probe(struct i2c_client *client)
 {
 	struct imx800 *imx800;
+	const struct imx800_mode_info *def_mode;
 	unsigned long rate;
 	unsigned int i;
+	u32 vblank, hblank;
 	int ret;
 
 	imx800 = devm_kzalloc(&client->dev, sizeof(*imx800), GFP_KERNEL);
@@ -368,6 +470,20 @@ static int imx800_probe(struct i2c_client *client)
 	imx800->dev = &client->dev;
 	dev_info(imx800->dev, "probe enter xclr=%d\n", xclr_gpio);
 	v4l2_i2c_subdev_init(&imx800->sd, client, &imx800_subdev_ops);
+
+	def_mode = &imx800_modes[0];
+	if (default_camx_mode >= 0) {
+		const struct imx800_mode_info *m =
+			imx800_find_mode_by_camx(default_camx_mode);
+
+		if (m)
+			def_mode = m;
+		else
+			dev_warn(imx800->dev,
+				 "unknown default_camx_mode=%d, using table default\n",
+				 default_camx_mode);
+	}
+	imx800->cur_mode = def_mode;
 
 	if (xclr_gpio >= 0) {
 		struct gpio_device *gdev;
@@ -432,14 +548,14 @@ static int imx800_probe(struct i2c_client *client)
 		goto err_power;
 
 	if (program_on_probe) {
-		ret = imx800_write_mode1(imx800);
+		ret = imx800_write_mode(imx800);
 		if (!ret)
 			ret = cci_multi_reg_write(imx800->regmap,
 						  imx800_stream_on_regs,
 						  ARRAY_SIZE(imx800_stream_on_regs),
 						  NULL);
 		dev_info(imx800->dev,
-			 "program_on_probe: init+mode1+stream %s (ret=%d)\n",
+			 "program_on_probe: init+mode+stream %s (ret=%d)\n",
 			 ret ? "FAILED" : "OK", ret);
 		/* leave streaming off after validation unless try_stream */
 		if (!ret && !try_stream)
@@ -458,7 +574,11 @@ static int imx800_probe(struct i2c_client *client)
 	if (ret)
 		goto err_power;
 
-	/* LINK_FREQ for camss; blanking/orientation for userspace soft-ISP. */
+	/*
+	 * LINK_FREQ required by qcom-camss before STREAMON.
+	 * Extra blanks/exposure/gain/orientation keep libcamera
+	 * CameraSensorLegacy + soft IPA happy for Snapshot/pipewire.
+	 */
 	ret = v4l2_ctrl_handler_init(&imx800->ctrl_handler, 8);
 	if (ret)
 		goto err_entity;
@@ -470,18 +590,21 @@ static int imx800_probe(struct i2c_client *client)
 		imx800->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	imx800->pixel_rate = v4l2_ctrl_new_std(
 		&imx800->ctrl_handler, NULL, V4L2_CID_PIXEL_RATE,
-		IMX800_PIXEL_RATE, IMX800_PIXEL_RATE, 1, IMX800_PIXEL_RATE);
-	/* vblank = FLL - height; hblank derived from LLP - width */
-	v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL, V4L2_CID_VBLANK,
-			  IMX800_MODE1_VBLANK, IMX800_MODE1_VBLANK, 1,
-			  IMX800_MODE1_VBLANK);
-	v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL, V4L2_CID_HBLANK,
-			  IMX800_MODE1_LLP - IMX800_MODE1_WIDTH,
-			  IMX800_MODE1_LLP - IMX800_MODE1_WIDTH, 1,
-			  IMX800_MODE1_LLP - IMX800_MODE1_WIDTH);
-	/* Fixed exposure/gain placeholders for soft-ISP pipelines. */
-	v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL, V4L2_CID_EXPOSURE,
-			  1, IMX800_MODE1_FLL - 1, 1, IMX800_MODE1_HEIGHT);
+		1, INT_MAX, 1, def_mode->pixel_rate);
+
+	vblank = def_mode->fll - def_mode->height;
+	hblank = def_mode->llp - def_mode->width;
+	imx800->vblank = v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL,
+					   V4L2_CID_VBLANK,
+					   vblank, vblank, 1, vblank);
+	imx800->hblank = v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL,
+					   V4L2_CID_HBLANK,
+					   hblank, hblank, 1, hblank);
+	/* Stub exposure/gain (CamX AE not ported yet); soft IPA still opens. */
+	imx800->exposure = v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL,
+					     V4L2_CID_EXPOSURE,
+					     1, def_mode->fll - 1, 1,
+					     def_mode->height);
 	v4l2_ctrl_new_std(&imx800->ctrl_handler, NULL, V4L2_CID_ANALOGUE_GAIN,
 			  0, 0xffff, 1, 0x100);
 	v4l2_ctrl_new_std_menu(&imx800->ctrl_handler, NULL,
@@ -505,16 +628,14 @@ static int imx800_probe(struct i2c_client *client)
 		ret = imx800->ctrl_handler.error;
 		goto err_ctrls;
 	}
-	/* Make blanking read-only (fixed mode-1 tables). */
+	/* Blanking / orientation / rotation fixed for programmed tables. */
 	{
 		struct v4l2_ctrl *c;
 
-		c = v4l2_ctrl_find(&imx800->ctrl_handler, V4L2_CID_VBLANK);
-		if (c)
-			c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
-		c = v4l2_ctrl_find(&imx800->ctrl_handler, V4L2_CID_HBLANK);
-		if (c)
-			c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+		if (imx800->vblank)
+			imx800->vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+		if (imx800->hblank)
+			imx800->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 		c = v4l2_ctrl_find(&imx800->ctrl_handler,
 				   V4L2_CID_CAMERA_ORIENTATION);
 		if (c)
@@ -534,8 +655,9 @@ static int imx800_probe(struct i2c_client *client)
 	pm_runtime_enable(imx800->dev);
 	pm_runtime_idle(imx800->dev);
 	dev_info(imx800->dev,
-		 "IMX800 registered (chip-ID OK; try_stream=%d; link_freq=%llu; rotation=%d CW)\n",
-		 try_stream, IMX800_LINK_FREQ_700MHZ, rotation);
+		 "IMX800 multi-mode registered (default camx=%u %ux%u; try_stream=%d; rotation=%d CW; nmodes=%u)\n",
+		 def_mode->camx_index, def_mode->width, def_mode->height,
+		 try_stream, rotation, (unsigned int)IMX800_NUM_MODES);
 	return 0;
 
 err_ctrls:
@@ -612,7 +734,7 @@ static int __init imx800_init(void)
 {
 	int ret;
 
-	pr_info("imx800: init xclr=%d\n", xclr_gpio);
+	pr_info("imx800: init xclr=%d multi-mode\n", xclr_gpio);
 	ret = i2c_add_driver(&imx800_driver);
 	if (ret)
 		return ret;
@@ -627,6 +749,5 @@ static void __exit imx800_exit(void)
 
 module_init(imx800_init);
 module_exit(imx800_exit);
-MODULE_DESCRIPTION("Sony IMX800 image sensor");
-MODULE_AUTHOR("isyourbrainfoss");
+MODULE_DESCRIPTION("Sony IMX800 multi-mode (FP5 CamX RE)");
 MODULE_LICENSE("GPL");

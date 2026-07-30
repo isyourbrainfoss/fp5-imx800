@@ -12,20 +12,36 @@ sc7280 tree). Not an official Fairphone or distribution package.
 | Item | Value |
 |------|--------|
 | Sensor | Sony IMX800 @ CCI0 / I2C `0x1a` |
-| Mode | 4096×3072, 10-bit **BGGR**, 2×2 bin (QCFA native 8192×6144) |
-| CSI | **C-PHY**, 3 trios, CSIPHY0 |
+| Formats | 10-bit **BGGR** (SBGGR10), C-PHY 3-trio on CSIPHY0 |
 | Link frequency | 700 MHz (timer-friendly; higher rates need more work) |
 | Reset | TLMM GPIO 20 (XCLR), active low |
 | MCLK | 24 MHz (`CAM_CC_MCLK0`) |
+| Rotation | 270° CW (matches other FP5 rear sensors) |
+
+## Sensor modes (CamX RE)
+
+Mode tables are decoded from Android CamX BinaryParameter
+(`com.qti.sensormodule.fp5_imx800.bin`). Regenerator:
+`driver/parse_camx_imx800.py` (expects the bin from a rooted vendor image;
+not redistributed here).
+
+| Default order | CamX idx | Size | Bin | ~RAW10/frame | Role |
+|--------------:|---------:|------|-----|-------------:|------|
+| **0** | **4** | **1920×1080** | 4×4 | **~2.5 MiB** | Preview / low CMA |
+| 1 | 1 | 4096×3072 | 2×2 | ~15 MiB | Hi-res still |
+| 2 | 5 | 1280×720 | 4×4 | ~1.1 MiB | Ultra-light |
+
+Default pad format is **1080p** so viewfinder buffers are ~6× smaller than
+always-4K (4 buffers ≈ 10 MiB vs ≈ 60 MiB). Details: `driver/IMX800-MODES.md`.
 
 ## Repository layout
 
 ```
-driver/     imx800 V4L2 subdev + mode tables (OOT-friendly)
+driver/     imx800 multi-mode V4L2 subdev + mode tables + CamX parser
 dt/         Board DT fragment (sensor + CSIPHY0 C-PHY endpoint)
 camss/      sc7280 C-PHY lane register table for qcom-camss
 libcamera/  Soft-IPA tuning sketch (black level / CCM)
-scripts/    Example load + raw capture helpers
+scripts/    Load + multi-size raw capture helpers
 ```
 
 ## What you need in the kernel
@@ -41,22 +57,41 @@ scripts/    Example load + raw capture helpers
 
 ```sh
 # after modules + DT are live
-v4l2-ctl -d /dev/v4l-subdevX --list-ctrls   # chip path via media-ctl -p
-media-ctl -d /dev/media0 -p | grep -A5 imx800
-# raw still (RDI):
-sudo ./scripts/capture-raw.sh /tmp/imx800.raw
-# expect ~15728640 bytes (packed 10-bit)
+media-ctl -d /dev/media0 -p | grep -A8 imx800
+# enum modes (use the imx800 subdev node from media-ctl):
+v4l2-ctl -d /dev/v4l-subdevX --list-subdev-framesizes pad=0,code=0x3007
+
+# raw stills (RDI) — default 1080p, or pass WxH
+sudo ./scripts/capture-raw.sh /tmp/imx800-1080.raw 1920x1080   # ~2592000 B
+sudo ./scripts/capture-raw.sh /tmp/imx800-4k.raw 4096x3072     # ~15728640 B
+sudo ./scripts/capture-raw.sh /tmp/imx800-720.raw 1280x720     # ~1152000 B
+
+# libcamera raw (example):
+cam -c <imx800-index> --stream role=raw,width=1920,height=1080 -C1 -F/tmp/raw-#.bin
 ```
+
+Optional demosaic preview (lab quality): `scripts/raw10_to_jpeg.py`.
 
 Userspace preview typically uses **libcamera** soft ISP + PipeWire. Install
 `libcamera/imx800.yaml` where your libcamera IPA looks for sensor tuning
 (often `/usr/share/libcamera/ipa/simple/`).
 
+**Note:** some soft-ISP viewfinder paths still open the largest sensor mode and
+downscale; prefer `role=raw` with an explicit size to keep CMA low.
+
+## Module parameters
+
+| Param | Default | Notes |
+|-------|---------|--------|
+| `default_camx_mode` | -1 (1080p table default) | Force CamX 4 / 1 / 5 |
+| `rotation` | 270 | Degrees clockwise |
+| `try_stream` | 1 | Program CamX tables on s_stream |
+
 ## Known limitations
 
-- One sensor mode (no high-res QCFA path, no AF/OIS yet).
-- Exposure/gain are placeholders; soft AWB/CCM only.
-- Large full-res buffers stress **CMA** (fragmentation after many open/close).
+- Exposure/gain are placeholders; soft AWB/CCM only (no full CamX AE).
+- No AF / OIS / full QCFA 8192×6144 path yet.
+- Full-res stills still stress **CMA** if opened often without release.
 - If the session manager enumerates cameras before modules load, restart
   WirePlumber (or equivalent) after inserting modules.
 
